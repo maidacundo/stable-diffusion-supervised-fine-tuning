@@ -1,0 +1,8 @@
+roboflow 
+diffusers 
+transformers 
+accelerate 
+wandb 
+omegaconf
+matplotlib
+torchvision
