@@ -16,7 +16,11 @@ def _get_cutout_holes(
     max_height=128,
     min_width=48,
     max_width=128,
+    seed=None,
 ):
+    if seed is not None:
+        random.seed(seed)  # Seed the random number generator
+
     holes = []
     for _n in range(random.randint(min_holes, max_holes)):
         hole_height = random.randint(min_height, max_height)
@@ -29,9 +33,9 @@ def _get_cutout_holes(
     return holes
 
 
-def _generate_random_mask(image):
+def _generate_random_mask(image, seed=None):
     mask = torch.zeros_like(image[:1])
-    holes = _get_cutout_holes(mask.shape[1], mask.shape[2])
+    holes = _get_cutout_holes(mask.shape[1], mask.shape[2], seed=seed)
     for (x1, y1, x2, y2) in holes:
         mask[:, y1:y2, x1:x2] = 1.0
     masked_image = image * (mask < 0.5)
@@ -56,6 +60,7 @@ class SFTInpaintDataset(Dataset):
         normalize=True,
         noise_offset: float = 0.1,
         train_inpainting: bool = True,
+        seed: Optional[int] = None,
     ):  
         
         self.resize = resize
@@ -108,6 +113,7 @@ class SFTInpaintDataset(Dataset):
         )
 
         self.noise_offset = noise_offset
+        self.seed = seed
 
     def __len__(self):
         return self._length
@@ -136,7 +142,7 @@ class SFTInpaintDataset(Dataset):
         (
             example["instance_masks"],
             example["instance_masked_images"],
-        ) = _generate_random_mask(example["instance_images"])
+        ) = _generate_random_mask(example["instance_images"], seed=self.seed)
 
         # instance_masked_values: The values of the masked instance image
         example["instance_masked_values"] = (

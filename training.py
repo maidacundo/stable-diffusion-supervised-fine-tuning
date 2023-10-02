@@ -5,6 +5,9 @@ import torch.utils.checkpoint
 import wandb
 from tqdm import tqdm
 import os
+import numpy as np
+
+from diffusers import StableDiffusionInpaintPipeline
 
 class SFTTrainer:
     def __init__(
@@ -13,26 +16,31 @@ class SFTTrainer:
         vae,
         text_encoder,
         noise_scheduler,
+        tokenizer,
         train_dataloader,
         val_dataloader,
         mask_temperature=1.0,
         device="cuda:0",
         save_dir="./outputs",
+        seed=42,
     ):
         self.unet = unet
         self.vae = vae
         self.text_encoder = text_encoder
         self.noise_scheduler = noise_scheduler
+        self.tokenizer = tokenizer
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.val_batch = next(iter(val_dataloader))
         self.mask_temperature = mask_temperature
         self.device = device
+        self.seed = seed
         self.vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         self.save_dir = save_dir
-        self.previous_val_loss = 0
+        self.previous_val_loss = np.inf
         self.current_val_loss = 0
 
     def loss_step(self, batch):
@@ -144,22 +152,62 @@ class SFTTrainer:
         "Validate for one epoch, log metrics and save model"
         self.unet.eval()
         pbar = tqdm(self.val_dataloader, leave=False, desc="Validation")
+        loss_avg = 0
         with torch.no_grad():
             for step, batch in enumerate(self.val_dataloader):
                 loss = self.loss_step(batch)
-            pbar.update(1)
-            pbar.set_postfix({"loss": loss.item()})
+                loss_avg += loss.item()
+                pbar.update(1)
+                
+            loss_avg /= len(self.val_dataloader)    
+            pbar.set_postfix({"loss": loss_avg.item()})
             wandb.log({
-                "val_loss": loss.item(),
+                "val_loss": loss_avg.item(),
                 })
-            self.current_val_loss = loss.item()
+            self.current_val_loss = loss_avg.item()
         pbar.close()
+
+    def val_generation(self):
+
+        g_cuda = torch.Generator(device='cuda').manual_seed(self.seed)
+
+        pipe = StableDiffusionInpaintPipeline(
+            vae=self.vae,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            unet=self.unet,
+            scheduler=self.noise_scheduler,
+            safety_checker=None,
+            feature_extractor=None,
+        )
+        
+        examples = []
+        for example in self.val_batch:
+            
+            image = example["pixel_values"]
+            mask = example["mask"]
+            prompt = self.tokenizer.batch_decode(example["input_ids"])
+            print(prompt)
+            generated_image = pipe(prompt=prompt,
+                                    image=image,
+                                    mask_image=mask,
+                                    generator=g_cuda,
+                                    num_inference_steps=20,
+                                    height=image.shape[-2],
+                                    width=image.shape[-1],
+                                    strength=0.99,
+                                    ).images[0]
+            image = wandb.Image(generated_image)
+            examples.append(image)
+        wandb.log({f"validation images": examples})
+
 
     def prepare(self, config):
         self.unet.to(self.device)
         self.vae.to(self.device)
         self.text_encoder.to(self.device)
-        self.optimizer = optim.AdamW(self.unet.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        parameters_to_optimize = [param for param in self.unet.parameters() if param.requires_grad]
+        self.optimizer = optim.AdamW(parameters_to_optimize, lr=config.lr, weight_decay=config.weight_decay)
         self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, config.epochs)
         self.scaler = torch.cuda.amp.GradScaler()
         wandb.init(project="sd-sft", entity='arked', config=config)
