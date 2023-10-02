@@ -3,6 +3,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.checkpoint
 import wandb
+from tqdm import tqdm
+import os
 
 class SFTTrainer:
     def __init__(
@@ -15,6 +17,7 @@ class SFTTrainer:
         val_dataloader,
         mask_temperature=1.0,
         device="cuda:0",
+        save_dir="./checkpoints",
     ):
         self.unet = unet
         self.vae = vae
@@ -26,26 +29,28 @@ class SFTTrainer:
         self.device = device
         self.vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        self.save_dir = save_dir
+
     def loss_step(self, batch):
         
         weight_dtype = torch.float32
         batch_size = batch["pixel_values"].shape[0]
         
         # encode the image
-        latents = self.vae.encode(batch["pixel_values"]).latent_dist.sample()
-        latents.to(dtype=weight_dtype, device=self.device)
+        latents = self.vae.encode(batch["pixel_values"].to(dtype=weight_dtype, device=self.device)).latent_dist.sample()
 
         # encode the masked image
-        masked_image_latents = self.vae.encode(batch["masked_image_values"]).latent_dist.sample()
-        masked_image_latents.to(dtype=weight_dtype, device=self.device)
-
+        masked_image_latents = self.vae.encode(batch["masked_image_values"].to(dtype=weight_dtype, device=self.device)).latent_dist.sample()
+        
         # scale the latents
         masked_image_latents = masked_image_latents * self.vae.config.scaling_factor
         latents = latents * self.vae.config.scaling_factor
 
         # scale the mask
         mask = F.interpolate(
-                    batch["mask"].to(dtype=weight_dtype, device=unet.device),
+                    batch["mask"].to(dtype=weight_dtype, device=self.device),
                     scale_factor=1 / self.vae_scale_factor,
                 )
 
@@ -53,7 +58,7 @@ class SFTTrainer:
         noise = torch.randn_like(latents)
         timesteps = torch.randint(
             0,
-            int(noise_scheduler.config.num_train_timesteps * t_mutliplier),
+            int(self.noise_scheduler.config.num_train_timesteps * 1.0),
             (batch_size,),
             device=latents.device,
         ).long()
@@ -65,17 +70,16 @@ class SFTTrainer:
             )
 
 
-        encoder_hidden_states = self.text_encoder(batch["input_ids"])[0]
-        encoder_hidden_states = encoder_hidden_states.to(text_encoder.device)
-
+        encoder_hidden_states = self.text_encoder(batch["input_ids"].to(self.device))[0]
+        
         model_pred = self.unet(latent_model_input, timesteps, encoder_hidden_states).sample
 
-        if noise_scheduler.config.prediction_type == "epsilon":
+        if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
-        elif noise_scheduler.config.prediction_type == "v_prediction":
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
-            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
         if batch.get("mask", None) is not None:
             
@@ -83,7 +87,7 @@ class SFTTrainer:
                 batch["mask"]
                 .to(model_pred.device)
                 .reshape(
-                    model_pred.shape[0], 1, model_pred.shape[2] * vae_scale_factor, model_pred.shape[3] * vae_scale_factor
+                    model_pred.shape[0], 1, model_pred.shape[2] * self.vae_scale_factor, model_pred.shape[3] * self.vae_scale_factor
                 )
             )
             # resize to match model_pred
@@ -93,7 +97,7 @@ class SFTTrainer:
                 mode="nearest",
             )
 
-            mask = mask.pow(mask_temperature)
+            mask = mask.pow(self.mask_temperature)
 
             mask = mask / mask.max()
 
@@ -107,11 +111,13 @@ class SFTTrainer:
 
 
     def train_step(self, loss):  
-        lr_scheduler.step()
-        optimizer.zero_grad()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.lr_scheduler.step()
+        torch.cuda.empty_cache()
 
     def train_epoch(self):
         "Train for one epoch, log metrics and save model"
@@ -119,7 +125,7 @@ class SFTTrainer:
         pbar = tqdm(self.train_dataloader, leave=False, desc="Training")
         
         for step, batch in enumerate(self.train_dataloader):
-            with torch.autocast(self.device):
+            with torch.autocast("cuda"):
                 loss = self.loss_step(batch)
 
             self.train_step(loss)
@@ -127,7 +133,7 @@ class SFTTrainer:
             pbar.set_postfix({"loss": loss.item()})
             wandb.log({
                 "loss": loss.item(),
-                "lr": self.scheduler.get_last_lr()[0]
+                "lr": self.lr_scheduler.get_last_lr()[0]
                 })
                 
         pbar.close()
@@ -138,22 +144,20 @@ class SFTTrainer:
         pbar = tqdm(self.val_dataloader, leave=False, desc="Validation")
         with torch.no_grad():
             for step, batch in enumerate(self.val_dataloader):
-                with torch.autocast(self.device):
-                    loss = self.loss_step(batch)
-                pbar.update(1)
-                pbar.set_postfix({"loss": loss.item()})
-                wandb.log({
-                    "val_loss": loss.item(),
-                    })
+                loss = self.loss_step(batch)
+            pbar.update(1)
+            pbar.set_postfix({"loss": loss.item()})
+            wandb.log({
+                "val_loss": loss.item(),
+                })
         pbar.close()
 
     def prepare(self, config):
         self.unet.to(self.device)
         self.vae.to(self.device)
         self.text_encoder.to(self.device)
-        self.noise_scheduler.to(self.device)
         self.optimizer = optim.AdamW(self.unet.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, config.epochs)
+        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, config.epochs)
         self.scaler = torch.cuda.amp.GradScaler()
         wandb.init(project="sd-sft", entity='arked', config=config)
         wandb.watch(self.unet, log="all")
@@ -168,31 +172,37 @@ class SFTTrainer:
         self.save(epoch)
 
     def save_model(self, epoch):
-        torch.save(self.unet.state_dict(), f"unet_{epoch}.pt")
+        save_path = os.path.join(self.save_dir, f"unet_{epoch}.pt")
+        torch.save(self.unet.state_dict(), save_path)
         # torch.save(self.vae.state_dict(), f"vae_{epoch}.pt")
         # torch.save(self.text_encoder.state_dict(), f"text_encoder_{epoch}.pt")
 
     def save_optimizer(self, epoch):
-        torch.save(self.optimizer.state_dict(), f"optimizer_{epoch}.pt")
+        save_path = os.path.join(self.save_dir, f"optimizer_{epoch}.pt")
+        torch.save(self.optimizer.state_dict(), save_path)
 
     def save_scheduler(self, epoch):
-        torch.save(self.scheduler.state_dict(), f"scheduler_{epoch}.pt")
+        save_path = os.path.join(self.save_dir, f"scheduler_{epoch}.pt")
+        torch.save(self.lr_scheduler.state_dict(), save_path)
 
     def load_model(self, epoch):
-        self.unet.load_state_dict(torch.load(f"unet_{epoch}.pt"))
+        load_path = os.path.join(self.save_dir, f"unet_{epoch}.pt")
+        self.unet.load_state_dict(torch.load(load_path))
         # self.vae.load_state_dict(torch.load(f"vae_{epoch}.pt"))
         # self.text_encoder.load_state_dict(torch.load(f"text_encoder_{epoch}.pt"))
 
     def load_optimizer(self, epoch):
-        self.optimizer.load_state_dict(torch.load(f"optimizer_{epoch}.pt"))
+        load_path = os.path.join(self.save_dir, f"optimizer_{epoch}.pt")
+        self.optimizer.load_state_dict(torch.load(load_path))
 
     def load_scheduler(self, epoch):
-        self.scheduler.load_state_dict(torch.load(f"scheduler_{epoch}.pt"))
+        load_path = os.path.join(self.save_dir, f"scheduler_{epoch}.pt")
+        self.lr_scheduler.load_state_dict(torch.load(load_path))
 
-    def load(self, epoch):
-        self.load_model(epoch)
-        self.load_optimizer(epoch)
-        self.load_scheduler(epoch)
+    def load(self, load_path):
+        self.load_model(load_path)
+        self.load_optimizer(load_path)
+        self.load_scheduler(load_path)
 
     def save(self, epoch):
         self.save_model(epoch)
@@ -201,8 +211,8 @@ class SFTTrainer:
 
     def print_model_info(self):
         total_params = sum(p.numel() for p in self.unet.parameters())
-        print(f"Unet: {total_params:,} total parameters.")
         total_trainable_params = sum(
             p.numel() for p in self.unet.parameters() if p.requires_grad
         )
+        print(f"Unet: {total_params:,} total parameters.")
         print(f"Unet: {total_trainable_params:,} training parameters.")

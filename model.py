@@ -57,7 +57,7 @@ def get_models(
 
 def get_ddim_scheduler(pretrained_model_name_or_path):
     scheduler = DDIMScheduler.from_pretrained(
-        pretrained_model_name_or_path,
+        'stabilityai/stable-diffusion-2-inpainting',
         subfolder="scheduler",
     )
     return scheduler

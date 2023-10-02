@@ -31,7 +31,6 @@ def _get_cutout_holes(
 
 def _generate_random_mask(image):
     mask = torch.zeros_like(image[:1])
-    print(mask.shape)
     holes = _get_cutout_holes(mask.shape[1], mask.shape[2])
     for (x1, y1, x2, y2) in holes:
         mask[:, y1:y2, x1:x2] = 1.0
@@ -96,9 +95,8 @@ class SFTInpaintDataset(Dataset):
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(
-                    size=self.min_size, 
+                    size=(self.min_size, self.min_size),
                     interpolation=transforms.InterpolationMode.BILINEAR,
-                    max_size=self.max_size, 
                 ) # the image size is as maximum 768x512
                 if resize
                 else transforms.Lambda(lambda x: x),
