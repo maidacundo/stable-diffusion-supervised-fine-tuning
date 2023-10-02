@@ -9,17 +9,19 @@ from typing import List, Optional
 
 def get_models(
     pretrained_model_name_or_path,
-    pretrained_vae_name_or_path,
+    pretrained_vae_name_or_path: Optional[str] = None,
     device: str = "cuda:0",
     load_from_safetensor=True,
 ):
     if load_from_safetensor:
 
-        print('loading VAE...')
+        if pretrained_vae_name_or_path is None:
+            raise ValueError("pretrained_vae_name_or_path must be specified if load_from_safetensor is True")
+        
         vae = AutoencoderKL.from_single_file(
             pretrained_vae_name_or_path,
         )
-        print('loading model...')
+        
         pipe = StableDiffusionInpaintPipeline.from_single_file(
             pretrained_model_name_or_path,
             vae=vae,
@@ -30,24 +32,14 @@ def get_models(
         unet = pipe.unet
 
     else:
-        tokenizer = CLIPTokenizer.from_pretrained(
+        print('loading model...')
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
             pretrained_model_name_or_path,
-            subfolder="tokenizer",
         )
-
-        text_encoder = CLIPTextModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="text_encoder",
-        )
-
-        vae = AutoencoderKL.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="vae",
-        )
-        unet = UNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="unet",
-        )
+        tokenizer = pipe.tokenizer
+        text_encoder = pipe.text_encoder
+        unet = pipe.unet
+        vae = pipe.vae
     return (
         text_encoder.to(device),
         vae.to(device),
@@ -57,7 +49,7 @@ def get_models(
 
 def get_ddim_scheduler(pretrained_model_name_or_path):
     scheduler = DDIMScheduler.from_pretrained(
-        'stabilityai/stable-diffusion-2-inpainting',
+        pretrained_model_name_or_path,
         subfolder="scheduler",
     )
     return scheduler

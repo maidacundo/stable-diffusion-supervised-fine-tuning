@@ -17,7 +17,7 @@ class SFTTrainer:
         val_dataloader,
         mask_temperature=1.0,
         device="cuda:0",
-        save_dir="./checkpoints",
+        save_dir="./outputs",
     ):
         self.unet = unet
         self.vae = vae
@@ -32,6 +32,8 @@ class SFTTrainer:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         self.save_dir = save_dir
+        self.previous_val_loss = 0
+        self.current_val_loss = 0
 
     def loss_step(self, batch):
         
@@ -150,6 +152,7 @@ class SFTTrainer:
             wandb.log({
                 "val_loss": loss.item(),
                 })
+            self.current_val_loss = loss.item()
         pbar.close()
 
     def prepare(self, config):
@@ -168,8 +171,9 @@ class SFTTrainer:
             self.train_epoch()
             if epoch % config.val_epochs == 0:
                 self.val_epoch()
-                self.save(epoch)
-        self.save(epoch)
+                if self.current_val_loss < self.previous_val_loss:
+                    self.previous_val_loss = self.current_val_loss
+                    self.save('best')
 
     def save_model(self, epoch):
         save_path = os.path.join(self.save_dir, f"unet_{epoch}.pt")
@@ -188,8 +192,6 @@ class SFTTrainer:
     def load_model(self, epoch):
         load_path = os.path.join(self.save_dir, f"unet_{epoch}.pt")
         self.unet.load_state_dict(torch.load(load_path))
-        # self.vae.load_state_dict(torch.load(f"vae_{epoch}.pt"))
-        # self.text_encoder.load_state_dict(torch.load(f"text_encoder_{epoch}.pt"))
 
     def load_optimizer(self, epoch):
         load_path = os.path.join(self.save_dir, f"optimizer_{epoch}.pt")
@@ -199,15 +201,17 @@ class SFTTrainer:
         load_path = os.path.join(self.save_dir, f"scheduler_{epoch}.pt")
         self.lr_scheduler.load_state_dict(torch.load(load_path))
 
-    def load(self, load_path):
-        self.load_model(load_path)
-        self.load_optimizer(load_path)
-        self.load_scheduler(load_path)
+    def load(self, epoch):
+        self.load_model(epoch)
+        self.load_optimizer(epoch)
+        self.load_scheduler(epoch)
 
     def save(self, epoch):
-        self.save_model(epoch)
-        self.save_optimizer(epoch)
-        self.save_scheduler(epoch)    
+        if self.current_val_loss < self.previous_val_loss:
+            self.previous_val_loss = self.current_val_loss
+            self.save_model(epoch)
+            self.save_optimizer(epoch)
+            self.save_scheduler(epoch)
 
     def print_model_info(self):
         total_params = sum(p.numel() for p in self.unet.parameters())
